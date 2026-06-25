@@ -3,15 +3,34 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 function extractRepoInfo(githubUrl) {
-  try {
-    const url = new URL(githubUrl);
-    const parts = url.pathname.split("/").filter(Boolean);
+  const normalized = githubUrl.trim();
+  if (!normalized) return null;
 
-    if (url.hostname.includes("github.com") && parts.length >= 2) {
+  const patterns = [
+    /^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i,
+    /^(?:git@github\.com:|ssh:\/\/git@github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match) {
       return {
-        owner: parts[0],
-        repo: parts[1],
+        owner: match[1],
+        repo: match[2].replace(/\.git$/i, ""),
       };
+    }
+  }
+
+  try {
+    const url = new URL(normalized.includes("://") ? normalized : `https://${normalized}`);
+    if (url.hostname.replace(/^www\./i, "") === "github.com") {
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts.length >= 2) {
+        return {
+          owner: parts[0],
+          repo: parts[1].replace(/\.git$/i, ""),
+        };
+      }
     }
   } catch {
     // Invalid URL
@@ -23,9 +42,68 @@ function extractRepoInfo(githubUrl) {
 async function fetchJson(url, headers = {}) {
   const response = await fetch(url, { headers });
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    throw new Error(`GitHub request failed with ${response.status}`);
   }
   return response.json();
+}
+
+async function fetchText(url, headers = {}) {
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`GitHub request failed with ${response.status}`);
+  }
+  return response.text();
+}
+
+function cleanJsonResponse(text) {
+  const trimmed = text.replace(/```(?:json)?/gi, "").trim();
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+
+  if (start !== -1 && end !== -1 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+
+  return trimmed;
+}
+
+function isValidAnalysisPayload(payload) {
+  return (
+    payload &&
+    typeof payload.projectPurpose === "string" &&
+    ["Beginner", "Intermediate", "Advanced"].includes(payload.difficultyLevel) &&
+    Array.isArray(payload.requiredSkills) &&
+    typeof payload.setupTimeEstimate === "string" &&
+    Array.isArray(payload.importantFiles) &&
+    typeof payload.resumeValueScore === "number"
+  );
+}
+
+function buildFallbackAnalysis(owner, repo, readmeContent, treeItems) {
+  const text = `${owner} ${repo} ${readmeContent}`.toLowerCase();
+  const skills = [];
+
+  if (text.includes("react") || text.includes("next")) skills.push("React / Next.js");
+  if (text.includes("typescript") || text.includes("ts")) skills.push("TypeScript");
+  if (text.includes("tailwind")) skills.push("Tailwind CSS");
+  if (text.includes("api") || text.includes("server")) skills.push("API integration");
+  if (text.includes("test") || treeItems.some((item) => item.includes("test"))) skills.push("Testing");
+  if (skills.length === 0) skills.push("Reading repository docs");
+
+  const importantFiles = treeItems.filter((item) => !item.includes("node_modules")).slice(0, 5);
+  const hasMultipleFiles = treeItems.length > 8;
+  const difficulty = hasMultipleFiles ? "Intermediate" : "Beginner";
+  const setupTime = difficulty === "Intermediate" ? "15-30 minutes" : "5-15 minutes";
+  const score = difficulty === "Intermediate" ? 6 : 5;
+
+  return {
+    projectPurpose: `This repository appears to be a software project focused on building and shipping a practical application or tool.`,
+    difficultyLevel: difficulty,
+    requiredSkills: skills,
+    setupTimeEstimate: setupTime,
+    importantFiles: importantFiles.length > 0 ? importantFiles : ["README.md"],
+    resumeValueScore: score,
+  };
 }
 
 export async function POST(request) {
@@ -45,73 +123,80 @@ export async function POST(request) {
     const { owner, repo } = repoInfo;
     const githubApiBase = `https://api.github.com/repos/${owner}/${repo}`;
 
-    const [readmeData, treeData] = await Promise.all([
-      fetchJson(`${githubApiBase}/readme`, {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "RepoLens",
-      }),
-      fetchJson(`${githubApiBase}/git/trees/HEAD?recursive=1`, {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "RepoLens",
-      }),
-    ]);
+    let readmeContent = "";
+    let treeItems = [];
 
-    const readmeContent = Buffer.from(readmeData.content, "base64").toString("utf-8");
-    const treeItems = treeData.tree?.map((item) => item.path).filter(Boolean).slice(0, 80) || [];
-
-    if (!process.env.GEMINI_API_KEY) {
-      return Response.json(
-        {
-          projectPurpose: "Repository analysis is unavailable because GEMINI_API_KEY is not configured.",
-          difficultyLevel: "Beginner",
-          requiredSkills: ["Setup environment", "Read repository docs"],
-          setupTimeEstimate: "10-20 minutes",
-          importantFiles: treeItems.slice(0, 5),
-          resumeValueScore: 5,
-        },
-        { status: 200 }
-      );
+    try {
+      readmeContent = await fetchText(`${githubApiBase}/readme`, {
+        Accept: "application/vnd.github.v3.raw",
+        "User-Agent": "RepoLens",
+      });
+    } catch {
+      readmeContent = "";
     }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    try {
+      const treeData = await fetchJson(`${githubApiBase}/git/trees/HEAD?recursive=1`, {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "RepoLens",
+      });
+      treeItems = treeData.tree?.map((item) => item.path).filter(Boolean).slice(0, 80) || [];
+    } catch {
+      treeItems = [];
+    }
 
-    const prompt = `
-Analyze the following GitHub repository information and return ONLY valid JSON with these exact keys:
-projectPurpose, difficultyLevel (Beginner/Intermediate/Advanced), requiredSkills (array of strings), setupTimeEstimate, importantFiles (array), resumeValueScore (number out of 10).
+    const fallbackPayload = buildFallbackAnalysis(owner, repo, readmeContent, treeItems);
+
+    if (!process.env.GEMINI_API_KEY) {
+      return Response.json(fallbackPayload, { status: 200 });
+    }
+
+    try {
+      const modelName = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+      const model = genAI.getGenerativeModel({ model: modelName });
+
+      const prompt = `
+You are a repository analyst. Return ONLY a valid JSON object with these exact keys and no extra text:
+projectPurpose, difficultyLevel, requiredSkills, setupTimeEstimate, importantFiles, resumeValueScore.
+
+Rules:
+- difficultyLevel must be exactly one of: Beginner, Intermediate, Advanced
+- requiredSkills must be an array of strings
+- importantFiles must be an array of strings
+- resumeValueScore must be a number between 0 and 10
+- Do not include markdown fences or commentary
 
 Repository: ${owner}/${repo}
 README:
-${readmeContent}
+${readmeContent.slice(0, 12000)}
 
 Root file tree:
 ${treeItems.join("\n")}
 `;
 
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      const cleanedText = cleanJsonResponse(responseText);
 
-    const cleanedText = responseText
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
+      let parsedJson;
+      try {
+        parsedJson = JSON.parse(cleanedText);
+      } catch {
+        return Response.json(fallbackPayload, { status: 200 });
+      }
 
-    let parsedJson;
-    try {
-      parsedJson = JSON.parse(cleanedText);
-    } catch {
-      parsedJson = {
-        projectPurpose: "Unable to parse Gemini response.",
-        difficultyLevel: "Beginner",
-        requiredSkills: ["Review repository manually"],
-        setupTimeEstimate: "15-30 minutes",
-        importantFiles: treeItems.slice(0, 5),
-        resumeValueScore: 5,
-      };
+      if (!isValidAnalysisPayload(parsedJson)) {
+        return Response.json(fallbackPayload, { status: 200 });
+      }
+
+      return Response.json(parsedJson, { status: 200 });
+    } catch (error) {
+      console.error("Gemini analysis failed, using fallback:", error);
+      return Response.json(fallbackPayload, { status: 200 });
     }
-
-    return Response.json(parsedJson, { status: 200 });
   } catch (error) {
     console.error("Analyze route error:", error);
-    return Response.json({ error: "Failed to analyze repository" }, { status: 500 });
+    const message = error instanceof Error ? error.message : "Failed to analyze repository";
+    return Response.json({ error: message }, { status: 500 });
   }
 }
